@@ -1,0 +1,3 @@
+# MINHA VERSÃO PARA A RINHA DE BACK-END 2025 
+# Só me aventurando...
+# usando nestjs
