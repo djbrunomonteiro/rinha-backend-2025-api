@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unsafe-argument */
 /* eslint-disable @typescript-eslint/no-unsafe-call */
 /* eslint-disable @typescript-eslint/no-unsafe-return */
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
@@ -9,6 +10,8 @@ import {
   BehaviorSubject,
   catchError,
   combineLatest,
+  delay,
+  EMPTY,
   filter,
   firstValueFrom,
   from,
@@ -54,28 +57,41 @@ export class AppService {
 
   constructor(private http: HttpService) {
     this.initDB();
+  
 
     this.listenHealth();
     this.listenEnqueuePayment();
   }
 
+  async purgePayment(){
+    this.db.exec(`DELETE FROM payments;`);
+    const response = await firstValueFrom(
+      this.http.post(`${this.defaultUrl}/admin/purge-payments`, {}, {
+        headers: {
+          'X-Rinha-Token': '123',
+        },
+      }),
+    );
+    return response.data;
+  }
+
   listenHealth() {
     const endpoints = [
-      { port: 8001, subject: this.defaultHealth$ },
-      { port: 8002, subject: this.fallbackHealth$ },
+      { path: this.defaultUrl, subject: this.defaultHealth$ },
+      { path: this.fallbackUrl, subject: this.fallbackHealth$ },
     ];
 
-    interval(6000)
+    interval(5100)
       .pipe(
         mergeMap(() => from(endpoints)),
-        mergeMap(({ port, subject }) => {
-          const url = `http://localhost:${port}/payments/service-health`;
+        mergeMap(({ path, subject }) => {
+          const url = `${path}/payments/service-health`;
           return this.rxCheckHealth(url).pipe(
             mergeMap((status) => {
-              console.log({port, status})
               subject.next(status);
               return of(null);
             }),
+            catchError(err => of(err))
           );
         }),
       )
@@ -83,17 +99,41 @@ export class AppService {
   }
 
   private rxCheckHealth(url: string) {
-    return from(firstValueFrom(this.http.get(url))).pipe(
+    return this.http.get(url, {
+      validateStatus: () => true
+    }).pipe(
       mergeMap((res) => {
-        const data = res.data;
+        if (res.status === 429) {
+          const retryAfter = parseInt(res.headers['retry-after'] || '5', 10);
+          return of({
+            healthy: false,
+            minResponseTime: Infinity,
+          }).pipe(delay(retryAfter * 1000));
+        }
+  
+        if (res.status >= 200 && res.status < 300) {
+          const data = res.data;
+          return of({
+            healthy: !data.failing,
+            minResponseTime: data.minResponseTime ?? Infinity,
+          });
+        }
+  
         return of({
-          healthy: !data.failing,
-          minResponseTime: data.minResponseTime ?? Infinity,
+          healthy: false,
+          minResponseTime: Infinity,
+        });
+      }),
+      catchError((err) => {
+        console.error(`[HEALTH] ${url} erro de conexão:`, err.message);
+        return of({
+          healthy: false,
+          minResponseTime: Infinity,
         });
       }),
     );
   }
-
+  
   listenEnqueuePayment() {
     this.paymentQueue$
       .pipe(mergeMap((payment) => this.processPayment(payment), 5))
@@ -106,7 +146,7 @@ export class AppService {
     });
   }
 
-  private  processPayment(paymentRequest: PaymentRequest) {
+  private processPayment(paymentRequest: PaymentRequest) {
     const process$ = combineLatest([
       this.defaultHealth$.pipe(take(1)),
       this.fallbackHealth$.pipe(take(1)),
@@ -114,44 +154,54 @@ export class AppService {
     ]).pipe(
       switchMap(([defaultHealth, fallbackHealth, isDefaultBlocked]) => {
         const shouldUseDefault = defaultHealth.healthy && !isDefaultBlocked;
- 
+  
         if (shouldUseDefault) {
           return this.tryProcess(paymentRequest.payment, 'default', this.defaultUrl).pipe(
             timeout(3000),
             catchError(() => {
               this.triggerDefaultCooldown();
               if (fallbackHealth.healthy) {
-                return this.tryProcess(
-                  paymentRequest.payment,
-                  'fallback',
-                  this.fallbackUrl,
-                ).pipe(timeout(3000));
+                return this.tryProcess(paymentRequest.payment, 'fallback', this.fallbackUrl).pipe(
+                  timeout(3000),
+                  catchError((err) => {
+                    return of(`falha no fallback: ${err.message || err}`);
+                  })
+                );
               }
-              return of('ambos falharam');
-            }),
+              return of('falha em ambos (default e fallback indisponível)');
+            })
           );
         }
-
+  
         if (fallbackHealth.healthy) {
           return this.tryProcess(paymentRequest.payment, 'fallback', this.fallbackUrl).pipe(
             timeout(3000),
+            catchError((err) => {
+              return of(`falha no fallback direto: ${err.message || err}`);
+            })
           );
         }
-
-        throw new Error('Deu ruim nenhum disponivel');
+  
+        // Ao invés de lançar erro direto, transforme em Observable
+        return of('nenhuma rota disponível (default e fallback indisponíveis)');
       }),
       tap({
         next: (result) => paymentRequest.resolve(result),
         error: (err) => paymentRequest.reject(err),
+      }),
+      // Segurança extra: qualquer erro escapa aqui
+      catchError((err) => {
+        paymentRequest.reject(err);
+        return EMPTY; // ou `of(null)` se quiser continuar a stream
       })
     );
-
-    return process$
+  
+    return process$;
   }
+  
 
   private tryProcess(payment: paymentDTO, origin: string, baseUrl: string, ) {
     const url = `${baseUrl}/payments`;
-    console.log(payment)
     return this.http.post(url, payment).pipe(
       timeout(5000),
       map(({ data }) => {
@@ -194,7 +244,7 @@ export class AppService {
       CREATE TABLE IF NOT EXISTS payments (
         correlation_id TEXT PRIMARY KEY,
         amount REAL NOT NULL,
-        requested_at TEXT NOT NULL,
+        requested_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
         origin TEXT NOT NULL
       );
     `);
@@ -203,9 +253,9 @@ export class AppService {
   add(payment: paymentDTO, origin: string){
     try {
       this.db.prepare(`
-        INSERT INTO payments (correlation_id, amount, requested_at, origin)
-        VALUES (?, ?, ?, ?)
-      `).run(payment.correlationId, payment.amount, payment.requestedAt, origin);
+        INSERT INTO payments (correlation_id, amount, origin)
+        VALUES (?, ?, ?)
+      `).run(payment.correlationId, payment.amount, origin);
       return true;
     } catch (e) {
       console.log(e)

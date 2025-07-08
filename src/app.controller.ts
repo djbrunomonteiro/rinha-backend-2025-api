@@ -6,6 +6,7 @@ import {
   Body,
   Controller,
   Get,
+  HttpCode,
   Post,
   Query,
 } from '@nestjs/common';
@@ -26,6 +27,12 @@ export class AppController {
     return this.appService.enqueuePayment(paymentData);
   }
 
+  @Post('purge-payments')
+  @HttpCode(200)
+  async purgePayment() {
+    return await this.appService.purgePayment();
+  }
+
   @Get('payments-summary')
   getSummary(@Query('from') from: string, @Query('to') to: string) {
     if (!from || !to) {
@@ -33,7 +40,6 @@ export class AppController {
         'Query params "from" and "to" are required',
       );
     }
-
     return this.appService.getPaymentsSummary(from, to);
   }
 }
