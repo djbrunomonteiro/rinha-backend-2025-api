@@ -36,6 +36,8 @@ interface PaymentRequest {
 
 @Injectable()
 export class AppService {
+  defaultUrl = process.env.PAYMENT_PROCESSOR_URL_DEFAULT || 'http://payment-processor-default:8080';;
+  fallbackUrl = process.env.PAYMENT_PROCESSOR_URL_FALLBACK || 'http://payment-processor-fallback:8080';
 
   private db: Database;
 
@@ -114,7 +116,7 @@ export class AppService {
         const shouldUseDefault = defaultHealth.healthy && !isDefaultBlocked;
  
         if (shouldUseDefault) {
-          return this.tryProcess(paymentRequest.payment, 'default', 'http://localhost:8001/').pipe(
+          return this.tryProcess(paymentRequest.payment, 'default', this.defaultUrl).pipe(
             timeout(3000),
             catchError(() => {
               this.triggerDefaultCooldown();
@@ -122,7 +124,7 @@ export class AppService {
                 return this.tryProcess(
                   paymentRequest.payment,
                   'fallback',
-                  'http://localhost:8002/',
+                  this.fallbackUrl,
                 ).pipe(timeout(3000));
               }
               return of('ambos falharam');
@@ -131,7 +133,7 @@ export class AppService {
         }
 
         if (fallbackHealth.healthy) {
-          return this.tryProcess(paymentRequest.payment, 'fallback', 'http://localhost:8002/').pipe(
+          return this.tryProcess(paymentRequest.payment, 'fallback', this.fallbackUrl).pipe(
             timeout(3000),
           );
         }
@@ -148,7 +150,7 @@ export class AppService {
   }
 
   private tryProcess(payment: paymentDTO, origin: string, baseUrl: string, ) {
-    const url = `${baseUrl}payments`;
+    const url = `${baseUrl}/payments`;
     console.log(payment)
     return this.http.post(url, payment).pipe(
       timeout(5000),
